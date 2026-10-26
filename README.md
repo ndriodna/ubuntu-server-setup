@@ -34,12 +34,25 @@ Kalau `sudo` dipakai, menu pertama menanyakan konfigurasi untuk user mana:
 
 ### Alur TUI
 
+TUI memakai **[gum](https://github.com/charmbracelet/gum)** (Charmbracelet,
+dibangun di atas Bubble Tea). Kalau `gum` belum ada, installer mengunduh rilis
+resminya ke `/usr/local/bin/gum` (butuh internet sekali saja). Bila gum tidak
+bisa dipasang, installer jatuh ke `whiptail` — dan bila keduanya tidak tersedia,
+ia berhenti dengan pesan jelas (tidak diam-diam melewati menu).
+
 1. Checklist komponen (`system base shell github docker dev ops security`).
 2. Checklist opsi (override alias, delta pager, starship, fish default, dry-run).
 3. Sub-menu `system` (swap / zram / timezone) dan `security` (ufw / fail2ban /
    unattended-upgrades / hardening SSH).
 4. Pilihan target user (jika dijalankan sebagai root).
 5. Konfirmasi, lalu eksekusi + verifikasi + ringkasan.
+
+Navigasi: `SPASI` pilih/lepas, `↑↓` geser, `ENTER` lanjut, `ESC` batal.
+Paksa backend lain dengan `UBUNTU_SETUP_UI=whiptail sudo ./install.sh`.
+
+> Jika terminal memakai `TERM=dumb` (mis. `docker exec` tanpa `-t`), TUI memang
+> tidak bisa jalan. Jalankan dari sesi SSH normal; skrip akan memberi pesan
+> sebelum gagal, bukan menu kosong.
 
 ### Contoh non-interaktif
 
@@ -89,6 +102,9 @@ Alias yang dipasang mencakup versi bash dan fish untuk: `ls/ll/la/l/lt` (eza),
 
 `./install.sh --help` menampilkan daftar lengkap.
 
+Variabel lingkungan: `UBUNTU_SETUP_UI=whiptail` memaksa backend whiptail
+(default: gum).
+
 ## Keamanan & rollback
 
 - Backup: `backups/<timestamp>/` (file user) dan `backups/<timestamp>/etc/`
@@ -137,6 +153,12 @@ Alias yang dipasang mencakup versi bash dan fish untuk: `ls/ll/la/l/lt` (eza),
 - **PATH `~/.local/bin`**: ditulis ke `.bashrc` *dan* `.profile`, karena
   `.bashrc` Ubuntu berhenti lebih awal pada shell non-interaktif. Shell `fish`
   sudah memakai `~/.local/bin` secara default.
+- **TUI (gum)**: `gum` dipasang otomatis ke `/usr/local/bin/gum` saat pertama
+  kali menu dibuka (butuh `curl` + internet; prasyaratnya dipasang bila perlu).
+  Saat `--dry-run`, gum dijalankan dari direktori sementara dan dihapus lagi,
+  jadi sistem tetap tidak berubah. `--all`/`--only=...` tidak memakai TUI sama
+  sekali, jadi aman untuk otomasi. `UBUNTU_SETUP_UI=whiptail` memaksa fallback
+  whiptail.
 - **Prasyarat unduhan**: langkah `github`/`docker`/`dev` otomatis memasang
   `ca-certificates`, `curl`, `gnupg`, dan `jq` bila belum ada, jadi
   `--only=docker` tetap jalan di sistem minimal.
@@ -153,7 +175,10 @@ privileged, cgroup host) dan Ubuntu 26.04 (unprivileged, tanpa systemd):
 | `--only=system,base,shell` | swap/zram ditolak kernel → warning, lanjut normal |
 | `--only=github,docker,dev,ops,security` | gh terpasang, docker daemon aktif, ufw/fail2ban aktif |
 | `--only=shell --target-user=deploy` | user dibuat, masuk grup sudo, ownership & fish default benar |
-| TUI asli (`whiptail`) | menu tampil, ESC → "dibatalkan", exit 1 |
+| TUI gum di image `ubuntu:24.04` kosong (tanpa curl) | gum 2.0.2 terpasang otomatis, menu tampil, ESC → "dibatalkan", exit 1 |
+| TUI gum alur penuh (komponen → opsi → system → security → target user → passphrase) | pilihan terbaca benar, lanjut ke rencana + dry-run, exit 0 |
+| TUI gum alur "buat user baru" | input nama + password tampil, target berubah ke user baru |
+| TUI fallback `whiptail` (`UBUNTU_SETUP_UI=whiptail`) | alur penuh + dry-run selesai, exit 0 |
 | `docker run hello-world` | sukses (docker-in-docker, butuh volume untuk `/var/lib/docker` & `/var/lib/containerd`) |
 
 Container tanpa `CAP_NET_ADMIN` (dan VPS OpenVZ/LXC sejenis) tidak bisa

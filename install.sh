@@ -19,7 +19,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 TS=$(date +%Y%m%d-%H%M%S)
@@ -70,8 +70,8 @@ TARGET_USER_ARG=""
 NEW_USER_PASSWORD=""
 
 case "$(uname -m)" in
-  x86_64)        ARCH_DEB=amd64; ARCH_GO=x86_64;  ARCH_RUST=x86_64;  ARCH_FF=amd64  ;;
-  aarch64|arm64) ARCH_DEB=arm64; ARCH_GO=arm64;   ARCH_RUST=aarch64; ARCH_FF=aarch64 ;;
+  x86_64)        ARCH_DEB=amd64; ARCH_GO=x86_64;  ARCH_RUST=x86_64;  ARCH_FF=amd64;  ARCH_BIN=x86_64 ;;
+  aarch64|arm64) ARCH_DEB=arm64; ARCH_GO=arm64;   ARCH_RUST=aarch64; ARCH_FF=aarch64; ARCH_BIN=arm64  ;;
   *) echo "Arsitektur $(uname -m) belum didukung." >&2; exit 1 ;;
 esac
 
@@ -110,6 +110,10 @@ SUDO_KEEPALIVE_PID=""
 cleanup() {
   if [[ -n ${SUDO_KEEPALIVE_PID} ]] && kill -0 "$SUDO_KEEPALIVE_PID" 2>/dev/null; then
     kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  fi
+  # gum sementara yang diunduh saat --dry-run
+  if [[ -n ${GUM_TMPDIR:-} ]]; then
+    rm -rf "$GUM_TMPDIR"
   fi
 }
 trap cleanup EXIT
@@ -411,26 +415,250 @@ step_label() {
 }
 
 # ---------------------------------------------------------------------------
+# Lapisan UI: gum (Charmbracelet/Bubble Tea) + fallback whiptail
+# ---------------------------------------------------------------------------
+UI_BACKEND=""
+GUM_BIN=""
+GUM_TMPDIR=""
+UI_RESULT=()
+UI_VALUE=""
+
+ensure_gum() {
+  if command -v gum >/dev/null 2>&1; then
+    GUM_BIN=$(command -v gum)
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    (( DRY_RUN )) && return 1
+    apt_install ca-certificates curl \
+      || { apt_update || true; apt_install ca-certificates curl || true; }
+  fi
+  command -v curl >/dev/null 2>&1 || { warn "curl tidak ada — gum tidak bisa diunduh"; return 1; }
+
+  local tag ver asset url tmp found bindir
+  tag=$(curl -fsSL --max-time 20 \
+        https://api.github.com/repos/charmbracelet/gum/releases/latest 2>/dev/null \
+        | grep -o '"tag_name": *"[^"]*"' | first_line | sed 's/.*"\(v[^"]*\)".*/\1/') || true
+  [[ -n $tag ]] || tag="v2.0.2"
+  ver=${tag#v}
+  asset="gum_${ver}_Linux_${ARCH_BIN}.tar.gz"
+  url="https://github.com/charmbracelet/gum/releases/download/${tag}/${asset}"
+
+  info "mengunduh TUI gum ${tag} (${ARCH_BIN})"
+  tmp=$(mktemp -d)
+  if ! curl -fsSL --retry 3 --max-time 120 "$url" -o "${tmp}/${asset}" \
+     || ! tar -xzf "${tmp}/${asset}" -C "$tmp"; then
+    warn "gagal mengunduh/mengekstrak gum: ${url}"
+    rm -rf "$tmp"
+    return 1
+  fi
+  found=$(find "$tmp" -type f -name gum -print -quit)
+  if [[ -z $found ]]; then
+    warn "binary gum tidak ditemukan di arsip"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  if (( DRY_RUN )); then
+    # jangan ubah sistem saat --dry-run: pakai gum dari direktori sementara
+    bindir=$(mktemp -d "${TMPDIR:-/tmp}/gum-bin.XXXXXX")
+    GUM_TMPDIR=$bindir
+  elif (( EUID == 0 )) && [[ -w /usr/local/bin ]]; then
+    bindir=/usr/local/bin
+  else
+    bindir="${HOME}/.local/bin"
+    mkdir -p "$bindir"
+  fi
+
+  if ! install -m 0755 "$found" "${bindir}/gum"; then
+    rm -rf "$tmp"
+    warn "gagal memasang gum ke ${bindir}"
+    return 1
+  fi
+  rm -rf "$tmp"
+  hash -r 2>/dev/null || true
+  GUM_BIN="${bindir}/gum"
+  [[ -x $GUM_BIN ]] || return 1
+  if (( DRY_RUN )); then
+    ok "gum ${tag} dipakai dari ${bindir} (sementara, dry-run tidak mengubah sistem)"
+    GUM_BIN=$(command -v gum 2>/dev/null || printf '%s' "$GUM_BIN")
+  else
+    ok "gum ${tag} terpasang → ${bindir}/gum"
+  fi
+  return 0
+}
+
+# Pilih backend TUI. gum diutamakan (Bubble Tea), whiptail hanya cadangan.
+ui_init() {
+  local prefer=${UBUNTU_SETUP_UI:-auto}
+
+  if [[ $prefer == whiptail ]]; then
+    if ! command -v whiptail >/dev/null 2>&1 && (( ! DRY_RUN )); then
+      apt_install whiptail || { apt_update || true; apt_install whiptail || true; }
+    fi
+    if command -v whiptail >/dev/null 2>&1; then
+      UI_BACKEND=whiptail
+      _log_raw "ui: whiptail (dipaksa lewat UBUNTU_SETUP_UI)"
+      return 0
+    fi
+    warn "UBUNTU_SETUP_UI=whiptail tetapi whiptail tidak tersedia — memakai gum"
+  fi
+
+  if command -v gum >/dev/null 2>&1; then
+    GUM_BIN=$(command -v gum)
+    UI_BACKEND=gum
+  elif ensure_gum; then
+    UI_BACKEND=gum
+  elif command -v whiptail >/dev/null 2>&1; then
+    UI_BACKEND=whiptail
+  else
+    if (( ! DRY_RUN )); then
+      apt_install whiptail || { apt_update || true; apt_install whiptail || true; }
+    fi
+    if command -v whiptail >/dev/null 2>&1; then
+      UI_BACKEND=whiptail
+    else
+      return 1
+    fi
+  fi
+  _log_raw "ui: ${UI_BACKEND}${GUM_BIN:+ (${GUM_BIN})}"
+  return 0
+}
+
+# Ambil key dari satu baris hasil gum ("key — deskripsi") atau whiptail ("key").
+ui_key_of() {
+  local line=${1//\"/}
+  line=${line%$'\r'}
+  line=${line#"${line%%[![:space:]]*}"}
+  printf '%s' "${line%% *}"
+}
+
+# ui_checklist JUDUL HEADER "key|deskripsi|ON" ...
+# Hasil: array UI_RESULT berisi key yang dicentang.
+ui_checklist() {
+  local title=$1 header=$2
+  shift 2
+  local -a items=("$@") opts=() pre=() wargs=()
+  local it key desc state
+
+  for it in "${items[@]}"; do
+    IFS='|' read -r key desc state <<<"$it"
+    opts+=("${key} — ${desc}")
+    if [[ ${state:-OFF} == ON ]]; then pre+=("${key} — ${desc}"); fi
+    wargs+=("$key" "$desc" "${state:-OFF}")
+  done
+
+  local out="" gum_args=()
+  if [[ $UI_BACKEND == gum ]]; then
+    gum_args=(choose --no-limit --height 12 --header "${title} · ${header}")
+    ((${#pre[@]})) && gum_args+=(--selected "$(IFS=,; printf '%s' "${pre[*]}")")
+    out=$("$GUM_BIN" "${gum_args[@]}" "${opts[@]}") || die "dibatalkan"
+  else
+    out=$(whiptail --title "$title" --checklist "$header" 22 110 12 \
+      "${wargs[@]}" 3>&1 1>&2 2>&3) || die "dibatalkan"
+  fi
+
+  UI_RESULT=()
+  if [[ $UI_BACKEND == gum ]]; then
+    local line
+    while IFS= read -r line; do
+      [[ -n ${line//[[:space:]]/} ]] || continue
+      UI_RESULT+=("$(ui_key_of "$line")")
+    done <<<"$out"
+  else
+    # whiptail mengembalikan semua tag dalam satu baris: "system" "base"
+    out=${out//\"/}
+    read -r -a UI_RESULT <<<"$out"
+  fi
+}
+
+# ui_menu JUDUL HEADER DEFAULT "key|deskripsi" ...
+# Hasil: UI_VALUE = key terpilih.
+ui_menu() {
+  local title=$1 header=$2 def=${3:-}
+  shift 3
+  local -a items=("$@") opts=() wargs=()
+  local it key desc
+  for it in "${items[@]}"; do
+    IFS='|' read -r key desc <<<"$it"
+    opts+=("${key} — ${desc}")
+    wargs+=("$key" "$desc")
+  done
+
+  local out=""
+  if [[ $UI_BACKEND == gum ]]; then
+    local -a gum_args=(choose --height 12 --header "${title} · ${header}")
+    if [[ -n $def ]]; then
+      local d
+      for d in "${opts[@]}"; do
+        [[ ${d%% *} == "$def" ]] && { gum_args+=(--selected "$d"); break; }
+      done
+    fi
+    out=$("$GUM_BIN" "${gum_args[@]}" "${opts[@]}") || die "dibatalkan"
+  else
+    local -a dargs=(--title "$title")
+    [[ -n $def ]] && dargs+=(--default-item "$def")
+    out=$(whiptail "${dargs[@]}" --menu "$header" 18 90 12 \
+      "${wargs[@]}" 3>&1 1>&2 2>&3) || die "dibatalkan"
+  fi
+  UI_VALUE=$(ui_key_of "$out")
+  [[ -n $UI_VALUE ]] || die "dibatalkan"
+}
+
+# ui_input JUDUL HEADER DEFAULT → UI_VALUE (kosong diizinkan)
+ui_input() {
+  local title=$1 header=$2 def=${3:-}
+  local out=""
+  if [[ $UI_BACKEND == gum ]]; then
+    out=$("$GUM_BIN" input --header "${title} · ${header}" --value "$def" \
+          --char-limit 128 --placeholder "ketik lalu ENTER") || out=$def
+  else
+    out=$(whiptail --title "$title" --inputbox "$header" 10 74 "$def" \
+          3>&1 1>&2 2>&3) || die "dibatalkan"
+  fi
+  UI_VALUE=${out%$'\r'}
+}
+
+# ui_password JUDUL HEADER → UI_VALUE (masked, kosong diizinkan)
+ui_password() {
+  local title=$1 header=$2
+  local out=""
+  if [[ $UI_BACKEND == gum ]]; then
+    out=$("$GUM_BIN" input --password --header "${title} · ${header}" \
+          --placeholder "kosongkan bila tidak perlu") || out=""
+  else
+    out=$(whiptail --title "$title" --passwordbox "$header" 10 74 "" \
+          3>&1 1>&2 2>&3) || out=""
+  fi
+  UI_VALUE=${out%$'\r'}
+}
+
+# ui_confirm PROMPT → exit 0 = ya, 1 = tidak
+ui_confirm() {
+  local prompt=$1
+  if [[ $UI_BACKEND == gum ]]; then
+    "$GUM_BIN" confirm "$prompt" --affirmative "Ya" --negative "Tidak" --default
+  else
+    whiptail --title "Konfirmasi" --yesno "$prompt" 10 70 3>&1 1>&2 2>&3
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Menu TUI
 # ---------------------------------------------------------------------------
 menu_categories() {
-  command -v whiptail >/dev/null 2>&1 || die "whiptail tidak ada (sudo apt install whiptail)"
-  local out
-  out=$(whiptail --title "Ubuntu Server Setup ${SCRIPT_VERSION}" --checklist \
-    "Pilih komponen (SPASI = pilih/lepas, ENTER = lanjut)." \
-    24 110 8 \
-    system   "swap, zram, timezone, sysctl" ON \
-    base     "htop btop tree duf fd bat eza fzf zoxide direnv yq shellcheck pipx rsync" ON \
-    shell    "Alias & hook bash + fish (eza/bat, docker, git, mkcd, extract)" ON \
-    github   "gh, SSH key ed25519, commit signing, ~/.ssh/config" ON \
-    docker   "Instal/verifikasi docker, dive, lazydocker" ON \
-    dev      "lazygit git-delta just httpie atuin starship" ON \
-    ops      "sysstat iotop strace lsof glances mtr nmap restic rclone" ON \
-    security "ufw, fail2ban, unattended-upgrades, hardening SSH" ON \
-    3>&1 1>&2 2>&3) || die "dibatalkan"
+  ui_checklist "Ubuntu Server Setup ${SCRIPT_VERSION}" \
+    "SPASI = pilih/lepas · ENTER = lanjut · ESC = batal" \
+    "system|swap/zram/timezone/sysctl|ON" \
+    "base|htop btop tree duf fd bat eza fzf zoxide direnv yq shellcheck pipx rsync|ON" \
+    "shell|Alias & hook bash + fish (eza/bat/docker/git/mkcd/extract)|ON" \
+    "github|gh + SSH key ed25519 + commit signing + ~/.ssh/config|ON" \
+    "docker|Instal/verifikasi docker + dive + lazydocker|ON" \
+    "dev|lazygit git-delta just httpie atuin starship|ON" \
+    "ops|sysstat iotop strace lsof glances mtr nmap restic rclone|ON" \
+    "security|ufw + fail2ban + unattended-upgrades + hardening SSH|ON"
 
-  out=${out//\"/}
-  read -r -a SELECTED <<<"$out"
+  SELECTED=("${UI_RESULT[@]}")
   ((${#SELECTED[@]})) || die "tidak ada komponen yang dipilih"
 }
 
@@ -440,23 +668,20 @@ menu_options() {
     starship_state=OFF
   fi
 
-  local out
-  out=$(whiptail --title "Opsi" --checklist "Opsi tambahan (SPASI = ubah):" 18 100 5 \
-    alias_override "Timpa alias ls/ll/la/l/cat dengan eza/bat" ON \
-    delta_pager    "Pakai delta sebagai git pager" ON \
-    starship       "Aktifkan starship (prompt tide akan tertimpa)" "$starship_state" \
-    fish_default   "Jadikan fish shell default user" ON \
-    dry_run        "Dry-run: tampilkan aksi tanpa mengubah sistem" OFF \
-    3>&1 1>&2 2>&3) || die "dibatalkan"
+  ui_checklist "Opsi tambahan" "SPASI = ubah · ENTER = lanjut · ESC = batal" \
+    "alias_override|Timpa alias ls/ll/la/l/cat dengan eza/bat|ON" \
+    "delta_pager|Pakai delta sebagai git pager|ON" \
+    "starship|Aktifkan starship (prompt tide akan tertimpa)|${starship_state}" \
+    "fish_default|Jadikan fish shell default user|ON" \
+    "dry_run|Dry-run: tampilkan aksi tanpa mengubah sistem|OFF"
 
   OPT_ALIAS_OVERRIDE=0
   OPT_DELTA_PAGER=0
   OPT_STARSHIP=0
   OPT_FISH_DEFAULT=0
 
-  out=${out//\"/}
   local o
-  for o in $out; do
+  for o in "${UI_RESULT[@]}"; do
     case $o in
       alias_override) OPT_ALIAS_OVERRIDE=1 ;;
       delta_pager)    OPT_DELTA_PAGER=1 ;;
@@ -469,16 +694,14 @@ menu_options() {
 }
 
 menu_system() {
-  local out
-  out=$(whiptail --title "System" --checklist "Pilih penyesuaian sistem:" 18 90 5 \
-    swap     "Buat swapfile ${SWAP_SIZE} + swappiness" ON \
-    zram     "zram (swap terkompresi di RAM)" ON \
-    timezone "Set timezone ${TZ_VALUE}" OFF \
-    3>&1 1>&2 2>&3) || die "dibatalkan"
+  ui_checklist "System" "SPASI = pilih/lepas · ENTER = lanjut · ESC = batal" \
+    "swap|Buat swapfile ${SWAP_SIZE} + swappiness|ON" \
+    "zram|zram (swap terkompresi di RAM)|ON" \
+    "timezone|Set timezone ${TZ_VALUE}|OFF"
+
   OPT_SWAP=0; OPT_ZRAM=0; OPT_TZ=0
-  out=${out//\"/}
   local o
-  for o in $out; do
+  for o in "${UI_RESULT[@]}"; do
     case $o in
       swap) OPT_SWAP=1 ;;
       zram) OPT_ZRAM=1 ;;
@@ -488,20 +711,17 @@ menu_system() {
 }
 
 menu_security() {
-  local out
-  out=$(whiptail --title "Keamanan" --checklist \
-    "Pilih langkah keamanan. Hardening SSH hanya aman bila login key sudah terbukti bekerja." \
-    20 100 6 \
-    ufw         "ufw: deny incoming, allow SSH" ON \
-    ufw_web     "ufw: izinkan 80/443" ON \
-    fail2ban    "fail2ban untuk sshd" ON \
-    unattended  "unattended-upgrades (patch otomatis)" ON \
-    ssh_harden  "SSH: matikan login password" OFF \
-    3>&1 1>&2 2>&3) || die "dibatalkan"
+  ui_checklist "Keamanan" \
+    "Hardening SSH hanya aman bila login key sudah terbukti bekerja" \
+    "ufw|ufw: deny incoming + allow SSH|ON" \
+    "ufw_web|ufw: izinkan 80/443|ON" \
+    "fail2ban|fail2ban untuk sshd|ON" \
+    "unattended|unattended-upgrades (patch otomatis)|ON" \
+    "ssh_harden|SSH: matikan login password|OFF"
+
   SEC_UFW=0; SEC_UFW_WEB=0; SEC_FAIL2BAN=0; SEC_UNATTENDED=0; SEC_SSH_HARDEN=0
-  out=${out//\"/}
   local o
-  for o in $out; do
+  for o in "${UI_RESULT[@]}"; do
     case $o in
       ufw) SEC_UFW=1 ;;
       ufw_web) SEC_UFW_WEB=1 ;;
@@ -516,9 +736,9 @@ ask_passphrase() {
   if (( ASSUME_YES )) || (( ! INTERACTIVE )); then
     return 0
   fi
-  OPT_SSH_PASSPHRASE=$(whiptail --title "SSH key" --passwordbox \
-    "Passphrase untuk SSH key baru (kosongkan untuk tanpa passphrase):" 10 70 "" \
-    3>&1 1>&2 2>&3) || OPT_SSH_PASSPHRASE=""
+  OPT_SSH_PASSPHRASE=""
+  ui_password "SSH key" "Passphrase untuk SSH key baru (kosong = tanpa passphrase)" || true
+  OPT_SSH_PASSPHRASE=$UI_VALUE
 }
 
 # ---------------------------------------------------------------------------
@@ -557,39 +777,41 @@ resolve_target() {
     TARGET_USER=$TARGET_USER_ARG
     TARGET_MODE=existing
   elif (( INTERACTIVE )); then
-    local choice default_choice=root
+    local default_choice=root
     if [[ -n ${SUDO_USER:-} ]] && id "$SUDO_USER" >/dev/null 2>&1; then
       default_choice=existing
     fi
-    choice=$(whiptail --title "Jalankan sebagai" --default-item "$default_choice" --menu \
-      "Script berjalan sebagai root. Konfigurasi user mana yang disiapkan?" 16 80 3 \
-      root     "root (simpel, tapi tidak disarankan untuk login harian)" \
-      existing "User yang sudah ada di sistem" \
-      create   "Buat user admin baru (sudo + authorized_keys)" \
-      3>&1 1>&2 2>&3) || die "dibatalkan"
+    ui_menu "Jalankan sebagai" "Script berjalan sebagai root — user mana yang disiapkan?" \
+      "$default_choice" \
+      "root|root (simpel tapi tidak disarankan untuk login harian)" \
+      "existing|User yang sudah ada di sistem" \
+      "create|Buat user admin baru (sudo + authorized_keys)"
+    local choice=$UI_VALUE
 
     case $choice in
       existing)
         local -a users=() u
-        while IFS=: read -r u _ _ _ _ _ _; do users+=("$u" "$u"); done < <(
-          awk -F: '$3>=1000 && $3<65000 {print $0}' /etc/passwd
-        )
+        while IFS=: read -r u _ _ _ _ _ _; do
+          [[ $u == nobody ]] && continue
+          users+=("${u}|$(getent passwd "$u" | cut -d: -f6)")
+        done < <(awk -F: '$3>=1000 && $3<65000 {print $0}' /etc/passwd)
         if ((${#users[@]} == 0)); then
           warn "tidak ada user non-root; memakai root"
           TARGET_MODE=root
           TARGET_USER=root
         else
-          TARGET_USER=$(whiptail --title "Pilih user" --menu "User mana?" 18 70 8 \
-            "${users[@]}" 3>&1 1>&2 2>&3) || die "dibatalkan"
+          ui_menu "Pilih user" "Konfigurasi disiapkan untuk user ini" \
+            "${users[0]%%|*}" "${users[@]}"
+          TARGET_USER=$UI_VALUE
           TARGET_MODE=existing
         fi
         ;;
       create)
-        TARGET_USER=$(whiptail --title "User baru" --inputbox \
-          "Nama user baru:" 10 60 "admin" 3>&1 1>&2 2>&3) || die "dibatalkan"
-        NEW_USER_PASSWORD=$(whiptail --title "Password" --passwordbox \
-          "Password untuk ${TARGET_USER} (kosongkan = dibuat acak):" 10 70 "" \
-          3>&1 1>&2 2>&3) || NEW_USER_PASSWORD=""
+        ui_input "User baru" "Nama user yang akan dibuat" "admin"
+        TARGET_USER=$UI_VALUE
+        [[ -n $TARGET_USER ]] || die "nama user tidak boleh kosong"
+        ui_password "Password ${TARGET_USER}" "Password user baru (kosong = dibuat acak)" || true
+        NEW_USER_PASSWORD=$UI_VALUE
         TARGET_MODE=create
         ;;
       *)
@@ -1236,10 +1458,12 @@ step_github() {
   fi
 
   if ! as_target gh auth status >/dev/null 2>&1; then
+    if (( DRY_RUN )); then
+      info "[dry-run] gh belum login — device flow dilewati"
+      return 0
+    fi
     if (( INTERACTIVE )) && (( ! ASSUME_YES )); then
-      if whiptail --title "GitHub" --yesno \
-        "gh belum login. Login sekarang lewat device flow?\n\nKamu akan diminta membuka github.com/login/device dan memasukkan kode." \
-        12 74 3>&1 1>&2 2>&3; then
+      if ui_confirm "gh belum login. Login sekarang lewat device flow? (buka github.com/login/device lalu masukkan kode)"; then
         run as_target gh auth login --hostname github.com --git-protocol ssh --web || true
       else
         warn "login dilewati. Jalankan manual: gh auth login"
@@ -1676,7 +1900,7 @@ Installer interaktif untuk VPS Ubuntu Server 24.04+ (fallback untuk 22.04).
 Semua langkah idempotent — boleh dijalankan berulang.
 
 PEMAKAIAN
-  sudo ./install.sh                    Menu interaktif (whiptail)
+  sudo ./install.sh                    Menu interaktif (gum / Bubble Tea)
   ./install.sh --all                   Semua komponen, default aman
   ./install.sh --only=base,shell       Komponen tertentu saja
   ./install.sh --all --dry-run         Tampilkan aksi tanpa mengubah sistem
@@ -1813,13 +2037,27 @@ main() {
   parse_args "$@"
 
   if ((${#SELECTED[@]} == 0)); then
-    if [[ -t 0 && -t 1 ]] && command -v whiptail >/dev/null 2>&1 && (( ! ASSUME_YES )); then
-      INTERACTIVE=1
-      menu_categories
-    else
+    if (( ASSUME_YES )) || [[ ! -t 0 || ! -t 1 ]]; then
       usage >&2
-      die "pilih komponen: --all atau --only=base,shell,..."
+      die "pilih komponen: --all atau --only=base,shell,... (TUI butuh terminal interaktif)"
     fi
+    INTERACTIVE=1
+    if [[ -z ${TERM:-} || ${TERM:-} == dumb ]]; then
+      usage >&2
+      die "TERM tidak mendukung TUI (TERM=${TERM:-kosong}). Jalankan dari terminal SSH biasa, atau pakai --all/--only=..."
+    fi
+    if ! ui_init; then
+      if (( DRY_RUN )); then
+        err "TUI belum tersedia dan tidak bisa dipasang saat --dry-run (curl/whiptail belum ada di sistem ini)."
+        err "Jalankan sekali tanpa --dry-run agar gum terpasang, atau pakai --all/--only=..."
+      else
+        err "TUI tidak tersedia: gum/whiptail gagal dipasang."
+        err "Pasang gum (charmbracelet/gum) atau whiptail lalu ulangi, atau pakai --all/--only=..."
+      fi
+      usage >&2
+      exit 1
+    fi
+    menu_categories
   fi
   validate_selection
 
@@ -1845,8 +2083,7 @@ main() {
   print_plan
 
   if (( ! DRY_RUN && ! ASSUME_YES && INTERACTIVE )); then
-    whiptail --title "Konfirmasi" --yesno "Mulai instalasi sekarang?" 8 60 \
-      3>&1 1>&2 2>&3 || die "dibatalkan"
+    ui_confirm "Mulai instalasi sekarang?" || die "dibatalkan"
   fi
 
   preflight

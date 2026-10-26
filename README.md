@@ -47,7 +47,7 @@ ia berhenti dengan pesan jelas (tidak diam-diam melewati menu).
 4. Pilihan target user (jika dijalankan sebagai root).
 5. Konfirmasi, lalu eksekusi + verifikasi + ringkasan.
 
-Navigasi: `SPASI` pilih/lepas, `↑↓` geser, `ENTER` lanjut, `ESC` batal.
+Navigasi di gum: `x` centang/lepas (**spasi tidak ter-bind di gum v2**), `ctrl+a` pilih semua, `↑↓` geser, `ENTER` lanjut, `ESC` batal. Petunjuk ini juga tampil di baris kedua header setiap checklist. Di whiptail tombolnya tetap `SPASI` (petunjuknya ikut tampil di header).
 Paksa backend lain dengan `UBUNTU_SETUP_UI=whiptail sudo ./install.sh`.
 
 > Jika terminal memakai `TERM=dumb` (mis. `docker exec` tanpa `-t`), TUI memang
@@ -178,6 +178,7 @@ privileged, cgroup host) dan Ubuntu 26.04 (unprivileged, tanpa systemd):
 | TUI gum di image `ubuntu:24.04` kosong (tanpa curl) | gum 2.0.2 terpasang otomatis, menu tampil, ESC → "dibatalkan", exit 1 |
 | TUI gum alur penuh (komponen → opsi → system → security → target user → passphrase) | pilihan terbaca benar, lanjut ke rencana + dry-run, exit 0 |
 | TUI gum alur "buat user baru" | input nama + password tampil, target berubah ke user baru |
+| TUI gum toggle `x` (lepas `system`) | rencana instalasi tanpa baris `system`, exit 0 |
 | TUI fallback `whiptail` (`UBUNTU_SETUP_UI=whiptail`) | alur penuh + dry-run selesai, exit 0 |
 | `docker run hello-world` | sukses (docker-in-docker, butuh volume untuk `/var/lib/docker` & `/var/lib/containerd`) |
 

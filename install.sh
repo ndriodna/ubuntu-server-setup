@@ -19,7 +19,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2.3.0"
+readonly SCRIPT_VERSION="2.3.1"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 TS=$(date +%Y%m%d-%H%M%S)
@@ -548,14 +548,18 @@ ui_checklist() {
     wargs+=("$key" "$desc" "${state:-OFF}")
   done
 
-  local out="" gum_args=()
+  local out="" gum_args=() hint
   if [[ $UI_BACKEND == gum ]]; then
-    gum_args=(choose --no-limit --height 12 --header "${title} · ${header}")
+    # gum v2: toggle = x (spasi tidak ter-bind), ctrl+a = pilih semua
+    hint="x = centang/lepas · ctrl+a = semua · ENTER = lanjut · ESC = batal"
+    # --no-show-help: footer bawaan gum berbahasa Inggris, ganti dengan hint sendiri
+    gum_args=(choose --no-limit --no-show-help --height 12 \
+      --header "${title} · ${header}"$'\n'"${hint}")
     ((${#pre[@]})) && gum_args+=(--selected "$(IFS=,; printf '%s' "${pre[*]}")")
     out=$("$GUM_BIN" "${gum_args[@]}" "${opts[@]}") || die "dibatalkan"
   else
-    out=$(whiptail --title "$title" --checklist "$header" 22 110 12 \
-      "${wargs[@]}" 3>&1 1>&2 2>&3) || die "dibatalkan"
+    out=$(whiptail --title "$title" --checklist "$header (SPASI = pilih/lepas, ENTER = lanjut)" \
+      22 110 12 "${wargs[@]}" 3>&1 1>&2 2>&3) || die "dibatalkan"
   fi
 
   UI_RESULT=()
@@ -648,7 +652,7 @@ ui_confirm() {
 # ---------------------------------------------------------------------------
 menu_categories() {
   ui_checklist "Ubuntu Server Setup ${SCRIPT_VERSION}" \
-    "SPASI = pilih/lepas · ENTER = lanjut · ESC = batal" \
+    "Pilih komponen yang akan dipasang" \
     "system|swap/zram/timezone/sysctl|ON" \
     "base|htop btop tree duf fd bat eza fzf zoxide direnv yq shellcheck pipx rsync|ON" \
     "shell|Alias & hook bash + fish (eza/bat/docker/git/mkcd/extract)|ON" \
@@ -668,7 +672,7 @@ menu_options() {
     starship_state=OFF
   fi
 
-  ui_checklist "Opsi tambahan" "SPASI = ubah · ENTER = lanjut · ESC = batal" \
+  ui_checklist "Opsi tambahan" "Opsi ini berlaku untuk semua langkah" \
     "alias_override|Timpa alias ls/ll/la/l/cat dengan eza/bat|ON" \
     "delta_pager|Pakai delta sebagai git pager|ON" \
     "starship|Aktifkan starship (prompt tide akan tertimpa)|${starship_state}" \
@@ -694,7 +698,7 @@ menu_options() {
 }
 
 menu_system() {
-  ui_checklist "System" "SPASI = pilih/lepas · ENTER = lanjut · ESC = batal" \
+  ui_checklist "System" "Penyesuaian sistem" \
     "swap|Buat swapfile ${SWAP_SIZE} + swappiness|ON" \
     "zram|zram (swap terkompresi di RAM)|ON" \
     "timezone|Set timezone ${TZ_VALUE}|OFF"

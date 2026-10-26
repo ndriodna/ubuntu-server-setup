@@ -19,7 +19,7 @@
 
 set -Eeuo pipefail
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 TS=$(date +%Y%m%d-%H%M%S)
@@ -1467,7 +1467,7 @@ step_ops() {
   step "Tool operasional"
 
   apt_install_optional sysstat iotop strace lsof glances mtr-tiny nmap restic rclone \
-    dnsutils netcat-openbsd
+    bind9-dnsutils netcat-openbsd
 
   run as_root systemctl enable --now sysstat 2>/dev/null || true
   info "sar/iostat dari sysstat; metrik dikumpulkan timer sysstat"
@@ -1480,51 +1480,75 @@ step_security() {
   step "Keamanan server"
 
   if (( SEC_UFW )); then
-    apt_install ufw
-    local ufw_active=0
-    if (( ! DRY_RUN )) && as_root ufw status 2>/dev/null | grep -q "Status: active"; then
-      ufw_active=1
-    fi
-    if (( ufw_active )); then
-      ok "ufw sudah aktif — aturan lama dipertahankan"
+    if apt_install ufw; then
+      # Container tanpa CAP_NET_ADMIN / OpenVZ-LXC sering menolak iptables
+      # walaupun berjalan sebagai root. Deteksi dulu, jangan bikin script mati.
+      if (( ! DRY_RUN )) && ! as_root iptables -S >/dev/null 2>&1; then
+        warn "iptables tidak dapat diakses (container/OpenVZ/LXC tanpa NET_ADMIN)"
+        warn "ufw dilewati — atur firewall di level host/provider"
+      else
+        local ufw_ok=1
+        if (( ! DRY_RUN )) && as_root ufw status 2>/dev/null | grep -q "Status: active"; then
+          ok "ufw sudah aktif — aturan lama dipertahankan"
+        else
+          run as_root ufw default deny incoming || ufw_ok=0
+          run as_root ufw default allow outgoing || ufw_ok=0
+        fi
+        run as_root ufw allow "${SSH_PORT}/tcp" || ufw_ok=0
+        if (( SEC_UFW_WEB )); then
+          run as_root ufw allow 80/tcp || ufw_ok=0
+          run as_root ufw allow 443/tcp || ufw_ok=0
+        fi
+        if (( ufw_ok )) && run as_root ufw --force enable; then
+          local opened="SSH ${SSH_PORT}"
+          if (( SEC_UFW_WEB )); then
+            opened+=", 80, 443"
+          fi
+          ok "ufw aktif (${opened})"
+        else
+          warn "ufw tidak dapat diaktifkan di sistem ini — langkah keamanan lain tetap dijalankan"
+          warn "aktifkan firewall dari panel provider atau host"
+        fi
+      fi
     else
-      run as_root ufw default deny incoming
-      run as_root ufw default allow outgoing
+      warn "ufw gagal dipasang — dilewati"
     fi
-    run as_root ufw allow "${SSH_PORT}/tcp"
-    if (( SEC_UFW_WEB )); then
-      run as_root ufw allow 80/tcp
-      run as_root ufw allow 443/tcp
-    fi
-    run as_root ufw --force enable
-    local opened="SSH ${SSH_PORT}"
-    if (( SEC_UFW_WEB )); then
-      opened+=", 80, 443"
-    fi
-    ok "ufw aktif (${opened})"
   fi
 
   if (( SEC_FAIL2BAN )); then
-    apt_install fail2ban
-    write_root_file /etc/fail2ban/jail.local "[sshd]
+    if apt_install fail2ban; then
+      write_root_file /etc/fail2ban/jail.local "[sshd]
 enabled = true
 port = ${SSH_PORT}
 backend = systemd
 maxretry = 5
 findtime = 10m
 bantime = 1h"
-    run as_root systemctl enable fail2ban || warn "gagal enable fail2ban"
-    run as_root systemctl restart fail2ban || warn "gagal start fail2ban"
-    ok "fail2ban aktif untuk sshd"
+      if run as_root systemctl enable fail2ban && run as_root systemctl restart fail2ban; then
+        ok "fail2ban aktif untuk sshd"
+      else
+        warn "fail2ban terpasang tapi tidak berjalan (systemd/iptables tidak tersedia?)"
+        warn "jail.local tetap ditulis; aktifkan manual setelah systemd & firewall siap"
+      fi
+    else
+      warn "fail2ban gagal dipasang — dilewati"
+    fi
   fi
 
   if (( SEC_UNATTENDED )); then
-    apt_install unattended-upgrades apt-listchanges
-    write_root_file /etc/apt/apt.conf.d/20auto-upgrades 'APT::Periodic::Update-Package-Lists "1";
+    if apt_install unattended-upgrades apt-listchanges; then
+      write_root_file /etc/apt/apt.conf.d/20auto-upgrades 'APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";'
-    run as_root systemctl enable unattended-upgrades || warn "gagal enable unattended-upgrades"
-    ok "unattended-upgrades aktif (tanpa reboot otomatis)"
+      if run as_root systemctl enable unattended-upgrades; then
+        ok "unattended-upgrades aktif (tanpa reboot otomatis)"
+      else
+        warn "unattended-upgrades terpasang tapi service tidak aktif (systemd tidak tersedia?)"
+        warn "konfigurasi 20auto-upgrades tetap ditulis"
+      fi
+    else
+      warn "unattended-upgrades gagal dipasang — dilewati"
+    fi
   fi
 
   if (( SEC_SSH_HARDEN )); then
@@ -1562,6 +1586,9 @@ short_version() {
     restic) out=$(timeout 5 restic version 2>/dev/null | first_line || true) ;;
     *)    out=$(timeout 5 "$c" --version 2>/dev/null | first_line || true) ;;
   esac
+  if [[ $out == *$'\e'* ]]; then
+    out=$(printf '%s' "$out" | sed $'s/\x1b\\[[0-9;]*[A-Za-z]//g')
+  fi
   printf '%s' "${out:--}"
 }
 

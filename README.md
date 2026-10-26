@@ -5,7 +5,7 @@ GitHub (SSH key + commit signing), Docker, tool dev/ops, dan langkah keamanan.
 Semua langkah idempotent — boleh dijalankan berulang, dan setiap file yang diubah
 dibackup lebih dulu.
 
-Target yang diuji: Ubuntu 24.04. Versi 22.04 sebagian besar jalan (ada fallback
+Target yang diuji: Ubuntu 24.04 dan 26.04. Versi 22.04 sebagian besar jalan (ada fallback
 untuk `eza` dan `7zip`).
 
 ## Prasyarat
@@ -60,7 +60,7 @@ sudo ./install.sh --all --target-user=deploy --user-password='...' --swap-size=4
 | `github` | install `gh` dari repo resmi, login device flow, SSH key ed25519, `~/.ssh/config`, commit signing (`gpg.format=ssh`), allowed_signers, uji commit bertanda tangan |
 | `docker` | Docker Engine + compose dari repo resmi (jika belum ada), verifikasi daemon, user masuk grup docker, `dive`, `lazydocker` |
 | `dev` | lazygit, git-delta (+ pager git), just, httpie, atuin, starship |
-| `ops` | sysstat, iotop, strace, lsof, glances, mtr, nmap, restic, rclone, dnsutils, netcat |
+| `ops` | sysstat, iotop, strace, lsof, glances, mtr, nmap, restic, rclone, bind9-dnsutils, netcat |
 | `security` | ufw (SSH + 80/443), fail2ban sshd, unattended-upgrades, hardening SSH opsional |
 
 Alias yang dipasang mencakup versi bash dan fish untuk: `ls/ll/la/l/lt` (eza),
@@ -144,16 +144,21 @@ Alias yang dipasang mencakup versi bash dan fish untuk: `ls/ll/la/l/lt` (eza),
 ## Sudah diuji di container
 
 Uji end-to-end dilakukan di container Ubuntu 24.04 (systemd sebagai PID 1,
-privileged, cgroup host):
+privileged, cgroup host) dan Ubuntu 26.04 (unprivileged, tanpa systemd):
 
 | Skenario | Hasil |
 |---|---|
-| `--all --yes` dari container kosong | exit 0, 21 langkah sukses |
+| `--all --yes` dari container kosong (24.04, privileged) | exit 0, 21 langkah sukses |
+| `--all --yes` dari container kosong (26.04, unprivileged) | exit 0, 0 error; ufw/fail2ban/zram dilewati dengan warning |
 | `--only=system,base,shell` | swap/zram ditolak kernel → warning, lanjut normal |
 | `--only=github,docker,dev,ops,security` | gh terpasang, docker daemon aktif, ufw/fail2ban aktif |
 | `--only=shell --target-user=deploy` | user dibuat, masuk grup sudo, ownership & fish default benar |
 | TUI asli (`whiptail`) | menu tampil, ESC → "dibatalkan", exit 1 |
 | `docker run hello-world` | sukses (docker-in-docker, butuh volume untuk `/var/lib/docker` & `/var/lib/containerd`) |
+
+Container tanpa `CAP_NET_ADMIN` (dan VPS OpenVZ/LXC sejenis) tidak bisa
+menjalankan `iptables`, jadi `ufw` dilewati dengan peringatan — atur firewall
+dari panel provider/host. Instalasi tetap selesai dengan exit 0.
 
 Yang **belum** teruji otomatis: login `gh` sungguhan (device flow), pendaftaran
 SSH key ke akun GitHub, hardening SSH pada sshd nyata, dan boot VPS asli.
